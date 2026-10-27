@@ -89,7 +89,8 @@ class RefineService {
     // Leijie Phase 1: every preset gets a length limit from the original's word count; no preset sees
     // the time budget. buildClipContext still computes it, for the log and for Fix timing in Phase 2.
     // A free-text request has no preset and so no limit.
-    const lengthLimit = preset ? this.computeLengthLimit(input.currentText, preset.lengthRatio) : undefined;
+    const lengthBase = preset?.requiresInstruction ? `${input.currentText} ${input.instruction || ''}` : input.currentText;
+    const lengthLimit = preset ? this.computeLengthLimit(lengthBase, preset.lengthRatio) : undefined;
 
     const userPrompt = buildRefineUserPrompt({
       currentText: input.currentText,
@@ -233,6 +234,9 @@ class RefineService {
 
     const preset = getRefinePreset(presetId);
     if (!preset) throw new HttpException(400, `Unknown presetId "${presetId}". Valid values: ${REFINE_PRESET_IDS.join(', ')}`);
+    if (preset.requiresInstruction && !instruction?.trim()) {
+      throw new HttpException(400, `${preset.label} needs the details to add. Type them in the text box first.`);
+    }
     return preset;
   }
 

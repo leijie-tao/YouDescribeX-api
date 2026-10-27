@@ -335,6 +335,26 @@ describe('RefineService.getSuggestion — prompt assembly', () => {
     expect(mockedCallLlmChat.mock.calls[1][0].temperature).toBeUndefined();
   });
 
+  it("rejects Add details without the describer's details, before calling the model", async () => {
+    stubHappyWorld();
+
+    await expect(new RefineService().getSuggestion({ ...baseInput, presetId: 'add-details' })).rejects.toMatchObject({ status: 400 });
+    await expect(new RefineService().getSuggestion({ ...baseInput, presetId: 'add-details', instruction: '  ' })).rejects.toMatchObject({ status: 400 });
+    expect(mockedCallLlmChat).not.toHaveBeenCalled();
+  });
+
+  it('sends the details as the additional request and counts them in the length limit', async () => {
+    stubHappyWorld();
+
+    await new RefineService().getSuggestion({ ...baseInput, presetId: 'add-details', instruction: 'the pot is terracotta' });
+
+    const prompt = sentUserPrompt();
+    expect(prompt).toContain('TASK: Add the details given in the ADDITIONAL REQUEST');
+    expect(prompt).toContain('ADDITIONAL REQUEST FROM THE DESCRIBER: the pot is terracotta');
+    // 13 original words + 4 detail words
+    expect(prompt).toContain('LENGTH LIMIT: 17 words or fewer.');
+  });
+
   it('builds every Style option from the shared shell', () => {
     const styles = REFINE_PRESETS.filter(preset => preset.id.startsWith('style-'));
 

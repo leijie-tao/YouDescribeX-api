@@ -17,11 +17,15 @@
 // allowed, and the only hard length guard is the character cap in refine.service.ts.
 // `temperature` overrides the default in llm.util.ts when a preset needs the model to stay closer to
 // the original wording.
+// `requiresInstruction` marks a preset that only works with the describer's free text: the service
+// answers 400 without it. Such a preset also counts the free text's words in its length limit, since
+// what the describer typed is exactly what gets added.
 export interface RefinePreset {
   id: string;
   label: string;
   lengthRatio: number;
   temperature?: number;
+  requiresInstruction?: boolean;
   instruction: string;
 }
 
@@ -30,6 +34,9 @@ export interface RefinePreset {
 export const CONCISE_LENGTH_RATIO = 0.7;
 export const POLISH_LENGTH_RATIO = 1.15;
 export const STYLE_LENGTH_RATIO = 1.2;
+// Leijie Applied to (original words + the describer's detail words): the details are added, nothing
+// else is, so the sum is already the natural upper bound.
+export const ADD_DETAILS_LENGTH_RATIO = 1;
 
 // Leijie Every Style option shares one shell; only the name and the block of focus rules differ.
 const buildStyleInstruction = (styleName: string, styleRules: string[]): string =>
@@ -84,6 +91,23 @@ const PRESETS = [
       '- Add, remove, or change any information.',
       '- Replace technical or domain-specific terms with simpler words.',
       '- Make it noticeably longer than the original.',
+    ].join('\n'),
+  },
+  // Leijie Text-only Add details (option B): the model cannot see the video and the AI draft's source
+  // material is not stored, so the describer supplies the details and the model works them in.
+  // Upgraded to frame-based detection in Phase 3.
+  {
+    id: 'add-details',
+    label: 'Add details',
+    lengthRatio: ADD_DETAILS_LENGTH_RATIO,
+    requiresInstruction: true,
+    instruction: [
+      'Add the details given in the ADDITIONAL REQUEST to this description. They come from the describer, who can see the video, so treat them as facts.',
+      '- Work every detail into the description in natural spoken sentences.',
+      '- Place each detail next to the person, object, or action it belongs to.',
+      '- Keep everything the description already says. If a detail contradicts it, follow the detail.',
+      '- Add nothing beyond the description and the ADDITIONAL REQUEST. Do not add interpretation.',
+      '- If not every detail fits within the length limit, keep the ones that matter most for following the video.',
     ].join('\n'),
   },
   {
