@@ -41,6 +41,9 @@ export const MIN_WORD_BUDGET = 3;
 export const MAX_SUGGESTION_GROWTH_FACTOR = 3;
 export const MIN_SUGGESTION_CHARS_ALLOWED = 400;
 
+/** Leijie Floor for the LENGTH LIMIT, so a one- or two-word original still gets a usable target. */
+export const MIN_LENGTH_LIMIT = 1;
+
 // xiao1009 What the controller hands over. `currentText` is the text in the describer's edit box,
 // which can differ from what the database holds, because the editor keeps unsaved edits in local
 // state (EditClip.tsx:81-83). The clip is still looked up in the database, for the ownership check,
@@ -66,6 +69,7 @@ export interface RefineClipContext {
   previousText?: string;
   nextText?: string;
   videoTitle?: string;
+  videoGenre?: string;
   availableSeconds?: number;
   wordBudget?: number;
 }
@@ -82,18 +86,18 @@ class RefineService {
     const audioDescription = await this.loadOwnedAudioDescription(input.audioDescriptionId, input.userId);
     const context = await this.buildClipContext(audioDescription, input.clipId);
 
-    // xiao1009 Only a preset that declares usesWordBudget gets the time budget in its prompt. Handing
-    // it to every preset would nudge the model into shortening text when the describer only asked to
-    // fix the grammar.
-    const includeWordBudget = preset?.usesWordBudget === true && context.wordBudget != null;
+    // Leijie Phase 1: every preset gets a length limit from the original's word count; no preset sees
+    // the time budget. buildClipContext still computes it, for the log and for Fix timing in Phase 2.
+    // A free-text request has no preset and so no limit.
+    const lengthLimit = preset ? this.computeLengthLimit(input.currentText, preset.lengthRatio) : undefined;
 
     const userPrompt = buildRefineUserPrompt({
       currentText: input.currentText,
       videoTitle: context.videoTitle,
+      videoGenre: context.videoGenre,
       previousText: context.previousText,
       nextText: context.nextText,
-      availableSeconds: includeWordBudget ? context.availableSeconds : undefined,
-      wordBudget: includeWordBudget ? context.wordBudget : undefined,
+      lengthLimit,
       presetInstruction: preset?.instruction,
       userInstruction: input.instruction,
     });
@@ -103,10 +107,10 @@ class RefineService {
     logger.info(
       `[refine ${requestId}] clip: ${input.clipId}, ad: ${input.audioDescriptionId}, preset: ${input.presetId || 'none'}, freeText: ${Boolean(
         input.instruction,
-      )}, availableSeconds: ${context.availableSeconds ?? 'n/a'}, wordBudget: ${includeWordBudget ? context.wordBudget : 'n/a'}`,
+      )}, availableSeconds: ${context.availableSeconds ?? 'n/a'}, lengthLimit: ${lengthLimit ?? 'n/a'}`,
     );
 
-    const completion = await callLlmChat({ systemPrompt: REFINE_SYSTEM_PROMPT, userPrompt });
+    const completion = await callLlmChat({ systemPrompt: REFINE_SYSTEM_PROMPT, userPrompt, temperature: preset?.temperature });
     const suggestion = this.cleanSuggestion(completion.text, input.currentText, requestId);
 
     return {
@@ -117,7 +121,8 @@ class RefineService {
           clipId: input.clipId,
           original: input.currentText,
           suggestion,
-          wordBudget: includeWordBudget ? context.wordBudget : undefined,
+          // Leijie Returning the description unchanged is a valid answer, so the panel can say so.
+          unchanged: suggestion === input.currentText.trim(),
         },
       ],
     };
@@ -152,6 +157,7 @@ class RefineService {
       previousText: this.readClipText(clips[index - 1]),
       nextText: this.readClipText(clips[index + 1]),
       videoTitle: video?.title,
+      videoGenre: video?.category || undefined,
       availableSeconds,
       wordBudget: availableSeconds != null ? this.computeWordBudget(availableSeconds) : undefined,
     };
@@ -195,6 +201,12 @@ class RefineService {
   /** xiao1009 Seconds to a word target, floored so a very tight gap still asks for a usable sentence. */
   private computeWordBudget(availableSeconds: number): number {
     return Math.max(MIN_WORD_BUDGET, Math.round(availableSeconds * SPEECH_WORDS_PER_SECOND));
+  }
+
+  /** Leijie Word count of the original times the preset's ratio, never below the floor. */
+  private computeLengthLimit(text: string, ratio: number): number {
+    const words = text.trim().split(/\s+/).filter(Boolean).length;
+    return Math.max(MIN_LENGTH_LIMIT, Math.round(words * ratio));
   }
 
   /**

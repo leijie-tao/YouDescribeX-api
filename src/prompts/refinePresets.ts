@@ -5,69 +5,128 @@
 // refinead-v1-options.md). Adding a preset = append one entry to PRESETS below, nothing else:
 // the id union, the id list and the lookup helper are all derived from that array.
 //
-// Wording sources, copied and adapted from the AI-generated-AD repo (read-only, never modified):
-//   - shorten-to-fit              : description_optimize_inline.py:235-241 (_COMPRESS_GUIDANCE) and :256-265 (compress task)
-//   - simplify                    : description_optimize_inline.py:332-336 (polish/rewrite prompt)
-//   - keep-onscreen-text-verbatim : description_optimize_inline.py:356-364 (_MIXED_GUIDANCE)
-//   - fix-grammar                 : no AI-generated-AD source; written from the "Correction" category listed in refinead-v1-options.md:104
+// Leijie Phase 1 button set from refinead-button-pipeline.md: Make concise, Polish (merges the old
+// Fix grammar) and four text-only Style options. Replaces shorten-to-fit, simplify, fix-grammar and
+// keep-onscreen-text-verbatim; RefineAD has not shipped, so the old ids are dropped, not aliased.
 //
 // Output-format rules ("reply with only the description text", no markdown) deliberately live in the
 // system prompt (refine.prompt.ts), not here, so that every preset shares one single set of rules.
 
-// xiao1009 `usesWordBudget` tells the prompt builder whether to include the available seconds and the
-// resulting word budget for this clip. Only compression actually needs it; adding it to every preset
-// would push the model to shorten text when the describer only asked to fix grammar.
+// Leijie `lengthRatio` sets the LENGTH LIMIT the prompt shows: round(original words × ratio). It is a
+// target for the model, not a check on the reply: returning the description unchanged is always
+// allowed, and the only hard length guard is the character cap in refine.service.ts.
+// `temperature` overrides the default in llm.util.ts when a preset needs the model to stay closer to
+// the original wording.
 export interface RefinePreset {
   id: string;
   label: string;
-  usesWordBudget: boolean;
+  lengthRatio: number;
+  temperature?: number;
   instruction: string;
 }
+
+// Leijie Ratios from refinead-button-pipeline.md section 3.1, kept as constants so they can be tuned
+// after evaluation.
+export const CONCISE_LENGTH_RATIO = 0.7;
+export const POLISH_LENGTH_RATIO = 1.15;
+export const STYLE_LENGTH_RATIO = 1.2;
+
+// Leijie Every Style option shares one shell; only the name and the block of focus rules differ.
+const buildStyleInstruction = (styleName: string, styleRules: string[]): string =>
+  [
+    `Rewrite this description with a ${styleName} emphasis.`,
+    'This is a style change. The original is not wrong. Shift what comes first and what gets attention. Do not change the facts.',
+    ...styleRules.map(rule => `- ${rule}`),
+    'Rules:',
+    '- Use only information from the current description and the context. If the description does not contain what this style needs, stay close to the original instead of inventing details.',
+    '- Keep any on-screen text in quotation marks, exactly as written, even when it moves to a new position.',
+    '- Never exceed the length limit.',
+    '- Match the tone of the video. Consider its title and genre.',
+  ].join('\n');
 
 // xiao1009 Id convention (decision 5B): lower-case kebab-case, verb first, never renamed once shipped,
 // new presets are appended. The frontend hard-codes the same ids in its own refinePresets.ts.
 const PRESETS = [
   {
-    id: 'shorten-to-fit',
-    label: 'Shorten to fit',
-    usesWordBudget: true,
-    instruction:
-      'Rewrite the description so that it fits the available narration time. ' +
-      'Preserve all concrete visual details: colors, materials, shapes, named objects, and character actions in their original order. ' +
-      "Drop only filler: vague qualifiers such as 'very' or 'really', redundant phrasing, and descriptions of a state that the action already implies. " +
-      'Do not change the meaning and do not remove any factual visual detail. ' +
-      'The result must be complete, grammatical sentence(s) with the same subject(s) and action(s) as the original. ' +
-      'If the description already fits the available time, return it unchanged.',
+    id: 'make-concise',
+    label: 'Make concise',
+    lengthRatio: CONCISE_LENGTH_RATIO,
+    instruction: [
+      'Make this description concise. Keep only what a blind listener needs at this moment.',
+      'Keep, in this priority order:',
+      '1. Who is acting and the main action.',
+      '2. Information needed to follow the story or the instructions.',
+      '3. On-screen text.',
+      '4. Names and key objects that later descriptions depend on.',
+      'Remove first:',
+      '- Details that do not change understanding: decorative adjectives, background clutter, camera language.',
+      '- Explanations of what is already obvious from the action.',
+      '- Anything the previous description already says.',
+      'Aim for the length limit or fewer words. Never drop items 1 or 2 just to reach the number.',
+      'If the description is already concise, make only small cuts or return it unchanged.',
+    ].join('\n'),
   },
   {
-    id: 'simplify',
-    label: 'Simplify',
-    usesWordBudget: false,
-    instruction:
-      'Rewrite the description in plainer, more direct language so that a listener understands it on first hearing. ' +
-      'Keep the same meaning and all visual details. ' +
-      'Prefer short sentences, everyday words and active voice over long clauses, jargon and nested descriptions. ' +
-      'Do not add interpretation, opinion, or any information that is not already in the description.',
+    id: 'polish',
+    label: 'Polish',
+    lengthRatio: POLISH_LENGTH_RATIO,
+    temperature: 0.2,
+    instruction: [
+      'Polish this description so it reads naturally and clearly when spoken aloud. Making it readable and natural comes first; fixing grammar comes second.',
+      'Do:',
+      '- Turn written-style sentences into clear spoken sentences: subject first, one main idea per sentence.',
+      '- Change passive voice to active voice.',
+      '- Replace a weak verb plus adverb with one precise verb. Example: "walks quickly" becomes "hurries".',
+      '- Replace a pronoun with a name or noun when it is unclear who it refers to.',
+      '- Use "a" when something first appears and "the" after that.',
+      '- Fix grammar, spelling, and punctuation errors.',
+      'Do not:',
+      '- Add, remove, or change any information.',
+      '- Replace technical or domain-specific terms with simpler words.',
+      '- Make it noticeably longer than the original.',
+    ].join('\n'),
   },
   {
-    id: 'fix-grammar',
-    label: 'Fix grammar',
-    usesWordBudget: false,
-    instruction:
-      'Correct only grammar, spelling, punctuation and word-order mistakes. ' +
-      'Do not rephrase for style, do not shorten or expand the text, and do not change which details are mentioned. ' +
-      'Leave any sentence that is already correct exactly as it is. ' +
-      'If the whole description is already correct, return it unchanged.',
+    id: 'style-character-focus',
+    label: 'Character focus',
+    lengthRatio: STYLE_LENGTH_RATIO,
+    instruction: buildStyleInstruction('character', [
+      'Lead with the people: who they are, what they visibly look like when it matters to the story, and their facial expressions, body language, and reactions.',
+      'Introduce a new character with a descriptor before the name, such as "a bearded man, Jack".',
+      'Move setting details after the characters, or drop the ones that are not needed.',
+    ]),
   },
   {
-    id: 'keep-onscreen-text-verbatim',
-    label: 'Keep on-screen text',
-    usesWordBudget: false,
-    instruction:
-      'Any words that literally appear on screen must be reproduced verbatim, character for character: ' +
-      'do not paraphrase, abbreviate, translate, or drop any of them, and do not wrap them in narrative phrases such as "a title card reads". ' +
-      'The surrounding visual description may be tightened by dropping filler and condensing phrasing, as long as the key visual details remain. ' +
-      'Do not prefix the result with labels such as "Text:", "Caption:" or "On screen:".',
+    id: 'style-action-focus',
+    label: 'Action focus',
+    lengthRatio: STYLE_LENGTH_RATIO,
+    instruction: buildStyleInstruction('action', [
+      'Lead with what happens: the actions in the order they occur, using precise verbs.',
+      'Mention people mainly as the ones doing the actions. Drop appearance and setting details unless they are needed to understand the action.',
+      'For instructional content, state the step first, then any detail needed to perform it.',
+    ]),
+  },
+  {
+    id: 'style-environment-focus',
+    label: 'Environment focus',
+    lengthRatio: STYLE_LENGTH_RATIO,
+    instruction: buildStyleInstruction('environment', [
+      'Lead with the setting: the location, the time of day, weather or lighting, key objects, and where things are placed in the space.',
+      'Compare sizes and shapes to familiar objects when that helps.',
+      'Then mention the people and the action briefly.',
+    ]),
+  },
+  {
+    id: 'style-simple-language',
+    label: 'Simple language',
+    lengthRatio: STYLE_LENGTH_RATIO,
+    instruction: buildStyleInstruction('simple language', [
+      'Use everyday words and short sentences that a child or a non-native English speaker can follow.',
+      'Replace uncommon words with common ones.',
+      'If a technical term is essential, keep it and add a few plain words that explain it.',
+      'If an explanation would go over the length limit, keep the term and skip the explanation.',
+      'No idioms or figures of speech.',
+    ]),
   },
 ] as const;
 
