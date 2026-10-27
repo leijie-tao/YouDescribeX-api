@@ -142,7 +142,7 @@ const PRESETS = [
   },
   {
     id: 'style-simple-language',
-    label: 'Simple language',
+    label: 'Simple words',
     lengthRatio: STYLE_LENGTH_RATIO,
     instruction: buildStyleInstruction('simple language', [
       'Use everyday words and short sentences that a child or a non-native English speaker can follow.',
