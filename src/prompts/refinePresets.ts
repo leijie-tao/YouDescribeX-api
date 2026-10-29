@@ -26,6 +26,9 @@ export interface RefinePreset {
   lengthRatio: number;
   temperature?: number;
   requiresInstruction?: boolean;
+  // Leijie Fix timing: the service runs the timing rules (refineTiming.util.ts) first and only calls
+  // the model when they say "shorten". Its length limit is the word budget, so lengthRatio is unused.
+  timing?: boolean;
   instruction: string;
 }
 
@@ -108,6 +111,23 @@ const PRESETS = [
       '- Keep everything the description already says. If a detail contradicts it, follow the detail.',
       '- Add nothing beyond the description and the ADDITIONAL REQUEST. Do not add interpretation.',
       '- If not every detail fits within the length limit, keep the ones that matter most for following the video.',
+    ].join('\n'),
+  },
+  // Leijie Prompt F1 of refinead-button-pipeline.md section 6.5, used only for the "shorten" branch.
+  {
+    id: 'fix-timing',
+    label: 'Fix timing',
+    lengthRatio: 1,
+    timing: true,
+    instruction: [
+      'Shorten this description so it can be spoken within the AVAILABLE TIME without overlapping dialogue.',
+      'Keep, in this priority order:',
+      '1. Who is acting and the main action.',
+      '2. Information needed to follow the story or the instructions.',
+      '3. On-screen text, kept in quotation marks exactly as written.',
+      'Cut first: adjectives and adverbs, setting details, secondary actions, and anything the previous description already says.',
+      'A short phrase without a verb is acceptable if it stays clear, for example "Rapunzel at the window."',
+      'The result must not exceed the length limit.',
     ].join('\n'),
   },
   {

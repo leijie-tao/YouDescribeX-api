@@ -45,6 +45,22 @@ export interface RefineSuggestionDto {
   original: string;
   suggestion: string;
   unchanged: boolean;
+  // Leijie Fix timing only. `availableSeconds` is left out when nothing bounds the clip.
+  timing?: RefineTimingDto;
+  timingChange?: RefineTimingChangeDto;
+  reason?: string;
+}
+
+export interface RefineTimingDto {
+  estimatedSeconds: number;
+  availableSeconds?: number;
+}
+
+// Leijie A suggestion only. RefineAD never applies it: the describer changes the start time or the
+// playback type in the editor and saves, which goes through the existing clip-update endpoints.
+export interface RefineTimingChangeDto {
+  startTime?: number;
+  track?: 'inline' | 'extended';
 }
 
 export interface RefineSuggestResponseDto {

@@ -7,7 +7,7 @@
 // still carry a postgres branch. RefineAD has no postgres path.
 import { Types } from 'mongoose';
 import { v4 as uuidv4 } from 'uuid';
-import { RefineSuggestResponseDto } from '../dtos/refine.dto';
+import { RefineSuggestResponseDto, RefineSuggestionDto, RefineTimingChangeDto } from '../dtos/refine.dto';
 import { HttpException } from '../exceptions/HttpException';
 import { IAudioClip } from '../models/mongodb/AudioClips.mongo';
 import { IAudioDescription } from '../models/mongodb/AudioDescriptions.mongo';
@@ -17,6 +17,7 @@ import { REFINE_PRESET_IDS, RefinePreset, getRefinePreset } from '../prompts/ref
 import { AuthorizationError } from '../utils/customErrors';
 import { callLlmChat } from '../utils/llm.util';
 import { logger } from '../utils/logger';
+import { MOVE_WINDOW_SECONDS, PlaybackType, TimeInterval, TimingPlan, planTiming } from '../utils/refineTiming.util';
 
 /**
  * xiao1009 Speech rate used to turn an available time window into a word target.
@@ -43,6 +44,9 @@ export const MIN_SUGGESTION_CHARS_ALLOWED = 400;
 
 /** Leijie Floor for the LENGTH LIMIT, so a one- or two-word original still gets a usable target. */
 export const MIN_LENGTH_LIMIT = 1;
+
+/** Leijie Reported as `model` when Fix timing answered from its rules alone, without calling the LLM. */
+export const RULES_ONLY_MODEL = 'none';
 
 // xiao1009 What the controller hands over. `currentText` is the text in the describer's edit box,
 // which can differ from what the database holds, because the editor keeps unsaved edits in local
@@ -72,6 +76,13 @@ export interface RefineClipContext {
   videoGenre?: string;
   availableSeconds?: number;
   wordBudget?: number;
+  // Leijie Read by Fix timing only.
+  playbackType: PlaybackType;
+  clipDuration?: number;
+  savedText?: string;
+  videoId: string;
+  videoDuration?: number;
+  otherClips: TimeInterval[];
 }
 
 class RefineService {
@@ -86,9 +97,11 @@ class RefineService {
     const audioDescription = await this.loadOwnedAudioDescription(input.audioDescriptionId, input.userId);
     const context = await this.buildClipContext(audioDescription, input.clipId);
 
-    // Leijie Phase 1: every preset gets a length limit from the original's word count; no preset sees
-    // the time budget. buildClipContext still computes it, for the log and for Fix timing in Phase 2.
-    // A free-text request has no preset and so no limit.
+    if (preset?.timing) return this.fixTiming(requestId, input, preset, context);
+
+    // Leijie Every text preset gets a length limit from the original's word count and never sees the
+    // time budget; buildClipContext still computes it, for the log. Fix timing has its own gap rules
+    // (refineTiming.util.ts). A free-text request has no preset and so no limit.
     const lengthBase = preset?.requiresInstruction ? `${input.currentText} ${input.instruction || ''}` : input.currentText;
     const lengthLimit = preset ? this.computeLengthLimit(lengthBase, preset.lengthRatio) : undefined;
 
@@ -161,7 +174,151 @@ class RefineService {
       videoGenre: video?.category || undefined,
       availableSeconds,
       wordBudget: availableSeconds != null ? this.computeWordBudget(availableSeconds) : undefined,
+      playbackType: clip.playback_type === 'extended' ? 'extended' : 'inline',
+      clipDuration: clip.duration > 0 ? clip.duration : undefined,
+      savedText: this.readClipText(clip),
+      videoId: audioDescription.video,
+      videoDuration: video?.duration,
+      otherClips: clips
+        .filter((_, i) => i !== index)
+        .filter(other => other.start_time != null && other.end_time != null)
+        .map(other => ({ start: other.start_time, end: other.end_time })),
     };
+  }
+
+  /**
+   * Leijie Fix timing. The rules pick the strategy; only "shorten" calls the model. Never writes
+   * anything: a suggested start time or playback type is returned for the describer to apply in the
+   * editor, and it is saved together with the clip, like any manual edit.
+   */
+  private async fixTiming(
+    requestId: string,
+    input: RefineSuggestionInput,
+    preset: RefinePreset,
+    context: RefineClipContext,
+  ): Promise<RefineSuggestResponseDto> {
+    const currentText = input.currentText.trim();
+    const wordCount = this.countWords(currentText);
+
+    // Leijie The TTS duration is exact, but only for the text that was saved. Unsaved edits are estimated.
+    const estimatedSeconds = context.clipDuration != null && context.savedText === currentText ? context.clipDuration : wordCount / SPEECH_WORDS_PER_SECOND;
+
+    const dialogs = await MongoDialog_Timestamps_Model.find({ video: context.videoId }).exec();
+
+    const plan = planTiming({
+      clipStart: context.startTime,
+      estimatedSeconds,
+      wordCount,
+      playbackType: context.playbackType,
+      dialogs: dialogs.map(dialog => ({ start: dialog.dialog_start_time, end: dialog.dialog_end_time })),
+      otherClips: context.otherClips,
+      videoDuration: context.videoDuration,
+      wordsPerSecond: SPEECH_WORDS_PER_SECOND,
+      minWordBudget: MIN_WORD_BUDGET,
+    });
+
+    logger.info(
+      `[refine ${requestId}] clip: ${input.clipId}, ad: ${input.audioDescriptionId}, preset: ${preset.id}, plan: ${
+        plan.kind
+      }, estimatedSeconds: ${estimatedSeconds.toFixed(2)}, availableSeconds: ${plan.availableSeconds}`,
+    );
+
+    const timing = {
+      estimatedSeconds: Math.round(estimatedSeconds * 100) / 100,
+      availableSeconds: Number.isFinite(plan.availableSeconds) ? Math.round(plan.availableSeconds * 100) / 100 : undefined,
+    };
+    const base: Omit<RefineSuggestionDto, 'suggestion' | 'unchanged'> = { clipId: input.clipId, original: input.currentText, timing };
+
+    if (plan.kind !== 'shorten') {
+      return {
+        requestId,
+        model: RULES_ONLY_MODEL,
+        suggestions: [
+          {
+            ...base,
+            suggestion: currentText,
+            unchanged: true,
+            timingChange: this.timingChangeFor(plan, context.playbackType),
+            reason: this.timingReason(plan, timing.estimatedSeconds, timing.availableSeconds),
+          },
+        ],
+      };
+    }
+
+    const userPrompt = buildRefineUserPrompt({
+      currentText: input.currentText,
+      videoTitle: context.videoTitle,
+      videoGenre: context.videoGenre,
+      previousText: context.previousText,
+      nextText: context.nextText,
+      availableSeconds: plan.availableSeconds,
+      lengthLimit: plan.wordBudget,
+      presetInstruction: preset.instruction,
+      userInstruction: input.instruction,
+    });
+
+    const completion = await callLlmChat({ systemPrompt: REFINE_SYSTEM_PROMPT, userPrompt, temperature: preset.temperature });
+    const suggestion = this.cleanSuggestion(completion.text, input.currentText, requestId);
+
+    // Leijie Decision 7: a reply that misses the budget is an error, not retried.
+    const suggestionWords = this.countWords(suggestion);
+    if (suggestionWords > plan.wordBudget) {
+      logger.error(`[refine ${requestId}] fix-timing reply over budget: ${suggestionWords} words, allowed ${plan.wordBudget}`);
+      throw new HttpException(502, 'The AI could not shorten the description enough. Please try again.');
+    }
+
+    return {
+      requestId,
+      model: completion.model,
+      suggestions: [
+        {
+          ...base,
+          suggestion,
+          unchanged: suggestion === currentText,
+          timingChange: this.timingChangeFor(plan, context.playbackType),
+          reason: this.timingReason(plan, timing.estimatedSeconds, timing.availableSeconds),
+        },
+      ],
+    };
+  }
+
+  /** Leijie The start time or playback type the describer should set, if any. */
+  private timingChangeFor(plan: TimingPlan, playbackType: PlaybackType): RefineTimingChangeDto | undefined {
+    switch (plan.kind) {
+      case 'switch-to-inline':
+        return { track: 'inline' };
+      case 'move':
+        return playbackType === 'extended' ? { startTime: plan.startTime, track: 'inline' } : { startTime: plan.startTime };
+      case 'extended':
+        return { track: 'extended' };
+      case 'shorten':
+        // A shortened extended clip can play inline once it fits.
+        return playbackType === 'extended' ? { track: 'inline' } : undefined;
+      default:
+        return undefined;
+    }
+  }
+
+  /** Leijie One plain sentence or two for the panel, saying what was decided and why. */
+  private timingReason(plan: TimingPlan, estimatedSeconds: number, availableSeconds?: number): string {
+    const need = `about ${estimatedSeconds.toFixed(1)} s of narration`;
+    const room = availableSeconds != null ? `${availableSeconds.toFixed(1)} s available` : 'no limit before the next dialogue or description';
+    switch (plan.kind) {
+      case 'fits':
+        return `It already fits: ${need}, ${room}.`;
+      case 'switch-to-inline':
+        return `It fits in the gap (${need}, ${room}), so it can play inline without pausing the video.`;
+      case 'shorten':
+        return `Too long for the gap (${need}, ${room}). Shortened to ${plan.wordBudget} words or fewer.`;
+      case 'move':
+        return `Too long for the gap (${need}, ${room}), and shortening would drop key information. Starting at ${plan.startTime.toFixed(
+          2,
+        )} s, it fits without overlapping dialogue or another description.`;
+      case 'extended':
+        return `Too long for the gap (${need}, ${room}), and no free gap within ${MOVE_WINDOW_SECONDS} s. Use extended playback so the video pauses for it.`;
+      default:
+        return `No inline gap within ${MOVE_WINDOW_SECONDS} s is long enough (${need}), so keep extended playback.`;
+    }
   }
 
   /**
@@ -206,8 +363,11 @@ class RefineService {
 
   /** Leijie Word count of the original times the preset's ratio, never below the floor. */
   private computeLengthLimit(text: string, ratio: number): number {
-    const words = text.trim().split(/\s+/).filter(Boolean).length;
-    return Math.max(MIN_LENGTH_LIMIT, Math.round(words * ratio));
+    return Math.max(MIN_LENGTH_LIMIT, Math.round(this.countWords(text) * ratio));
+  }
+
+  private countWords(text: string): number {
+    return text.trim().split(/\s+/).filter(Boolean).length;
   }
 
   /**

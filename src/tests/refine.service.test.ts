@@ -34,6 +34,7 @@ interface StubClip {
   end_time?: number;
   duration?: number;
   transcript?: { sentence: string }[];
+  playback_type?: 'inline' | 'extended';
 }
 
 const makeClip = (id: string, startTime: number, text: string, duration = 3): StubClip => ({
@@ -59,6 +60,10 @@ const stubNextDialog = (doc: unknown) =>
   jest.spyOn(MongoDialog_Timestamps_Model as any, 'findOne').mockReturnValue({
     sort: () => ({ exec: async () => doc }),
   } as any);
+
+// Leijie Fix timing reads every dialogue line of the video with find(), not findOne().
+const stubDialogs = (docs: { dialog_start_time: number; dialog_end_time: number }[]) =>
+  jest.spyOn(MongoDialog_Timestamps_Model as any, 'find').mockReturnValue({ exec: async () => docs } as any);
 
 const ownedAudioDescription = { _id: AD_ID, user: USER_ID, video: VIDEO_ID };
 
@@ -512,6 +517,105 @@ describe('RefineService.getSuggestion — failures', () => {
     mockedCallLlmChat.mockResolvedValue({ text: 'x'.repeat(5000), model: 'gpt-4o-mini', responseId: 'r' });
 
     await expect(new RefineService().getSuggestion({ ...baseInput, presetId: 'polish' })).rejects.toMatchObject({ status: 502 });
+  });
+});
+
+describe('RefineService.getSuggestion — Fix timing', () => {
+  const fixTiming = (overrides: Record<string, unknown> = {}) => new RefineService().getSuggestion({ ...baseInput, presetId: 'fix-timing', ...overrides });
+
+  it('answers from the rules alone when the saved clip already fits', async () => {
+    stubHappyWorld();
+    stubDialogs([]);
+
+    const response = await fixTiming();
+
+    expect(mockedCallLlmChat).not.toHaveBeenCalled();
+    expect(response.model).toBe('none');
+    // saved text, so the TTS duration (3 s) is used; the next clip starts 4.5 s later
+    expect(response.suggestions[0]).toMatchObject({
+      suggestion: baseInput.currentText,
+      unchanged: true,
+      timing: { estimatedSeconds: 3, availableSeconds: 4.5 },
+    });
+    expect(response.suggestions[0].timingChange).toBeUndefined();
+    expect(response.suggestions[0].reason).toMatch(/already fits/);
+  });
+
+  it('suggests inline for an extended clip that fits', async () => {
+    stubAudioDescription(ownedAudioDescription);
+    stubClips([{ ...makeClip(CLIP_ID, 10, baseInput.currentText), playback_type: 'extended' }, makeClip(NEXT_CLIP_ID, 14.5, 'Next.')]);
+    stubVideo({ title: 'A video', duration: 60 });
+    stubNextDialog(null);
+    stubDialogs([]);
+
+    const response = await fixTiming();
+
+    expect(response.suggestions[0].timingChange).toEqual({ track: 'inline' });
+  });
+
+  it('shortens unsaved text to the word budget, estimating its length from the words', async () => {
+    stubHappyWorld();
+    stubDialogs([{ dialog_start_time: 12, dialog_end_time: 13 }]);
+    mockedCallLlmChat.mockResolvedValue({ text: 'She tips the plant out.', model: 'gpt-4o-mini', responseId: 'r' });
+
+    // 8 unsaved words -> 2.67 s; 2 s gap -> 6 words, and 6 >= 8 x 0.6
+    const response = await fixTiming({ currentText: 'She carefully tips the plant out of it.' });
+
+    const prompt = mockedCallLlmChat.mock.calls[0][0].userPrompt;
+    expect(prompt).toContain('AVAILABLE TIME: 2.00 seconds');
+    expect(prompt).toContain('LENGTH LIMIT: 6 words or fewer.');
+    expect(prompt).toContain('TASK: Shorten this description');
+    expect(response.suggestions[0]).toMatchObject({ suggestion: 'She tips the plant out.', unchanged: false, timing: { availableSeconds: 2 } });
+    expect(response.suggestions[0].reason).toMatch(/Shortened to 6 words/);
+  });
+
+  it('turns a reply over the word budget into a 502', async () => {
+    stubHappyWorld();
+    stubDialogs([{ dialog_start_time: 12, dialog_end_time: 13 }]);
+    mockedCallLlmChat.mockResolvedValue({ text: 'She still very carefully tips the plant out of it.', model: 'gpt-4o-mini', responseId: 'r' });
+
+    await expect(fixTiming({ currentText: 'She carefully tips the plant out of it.' })).rejects.toMatchObject({ status: 502 });
+  });
+
+  it('suggests a new start time when shortening would drop too much', async () => {
+    stubAudioDescription(ownedAudioDescription);
+    stubClips([makeClip(PREV_CLIP_ID, 2, 'Earlier.'), makeClip(CLIP_ID, 10, baseInput.currentText, 4), makeClip(NEXT_CLIP_ID, 20, 'Later.', 4)]);
+    stubVideo({ title: 'A video', duration: 60 });
+    stubNextDialog(null);
+    stubDialogs([{ dialog_start_time: 11, dialog_end_time: 12.5 }]);
+
+    const response = await fixTiming();
+
+    expect(mockedCallLlmChat).not.toHaveBeenCalled();
+    expect(response.suggestions[0].timingChange).toEqual({ startTime: 12.5 });
+    expect(response.suggestions[0].unchanged).toBe(true);
+  });
+
+  it('suggests extended playback when there is no gap nearby', async () => {
+    stubAudioDescription(ownedAudioDescription);
+    stubClips([makeClip(CLIP_ID, 10, baseInput.currentText, 4)]);
+    stubVideo({ title: 'A video', duration: 60 });
+    stubNextDialog(null);
+    stubDialogs([{ dialog_start_time: 6, dialog_end_time: 20 }]);
+
+    const response = await fixTiming();
+
+    expect(response.suggestions[0].timingChange).toEqual({ track: 'extended' });
+    expect(response.suggestions[0].reason).toMatch(/extended playback/);
+  });
+
+  it('writes nothing to the database', async () => {
+    stubHappyWorld();
+    stubDialogs([]);
+    const writeSpies = [
+      jest.spyOn(MongoAudioClipsModel as any, 'updateOne'),
+      jest.spyOn(MongoAudioClipsModel as any, 'updateMany'),
+      jest.spyOn(MongoAudioClipsModel as any, 'findByIdAndUpdate'),
+    ];
+
+    await fixTiming();
+
+    writeSpies.forEach(spy => expect(spy).not.toHaveBeenCalled());
   });
 });
 
