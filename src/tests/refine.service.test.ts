@@ -3,7 +3,7 @@
 // (construct the service directly, cast to any, stub what it reaches for).
 import { LlmError, callLlmChat } from '../utils/llm.util';
 import { MongoAudioClipsModel, MongoAudio_Descriptions_Model, MongoDialog_Timestamps_Model, MongoVideosModel } from '../models/mongodb/init-models.mongo';
-import RefineService, { MIN_LENGTH_LIMIT, MIN_WORD_BUDGET, SPEECH_WORDS_PER_SECOND } from '../services/refine.service';
+import RefineService, { MIN_LENGTH_LIMIT, MIN_WORD_BUDGET, RULES_ONLY_MODEL, SPEECH_WORDS_PER_SECOND } from '../services/refine.service';
 import { CONCISE_LENGTH_RATIO, REFINE_PRESETS } from '../prompts/refinePresets';
 import { REFINE_SYSTEM_PROMPT } from '../prompts/refine.prompt';
 
@@ -436,6 +436,30 @@ describe('RefineService.getSuggestion — response', () => {
     const response = await new RefineService().getSuggestion({ ...baseInput, presetId: 'make-concise' });
 
     expect(response.suggestions[0]).toMatchObject({ suggestion: baseInput.currentText, unchanged: true });
+  });
+
+  // Leijie STYLE_MIN_WORDS: a description too short to restyle never reaches the model.
+  it('answers a too-short description unchanged for a Style option, without calling the model', async () => {
+    stubHappyWorld();
+
+    const response = await new RefineService().getSuggestion({
+      ...baseInput,
+      currentText: 'Colette uncovers the baked ratatouille.',
+      presetId: 'style-character-focus',
+    });
+
+    expect(mockedCallLlmChat).not.toHaveBeenCalled();
+    expect(response.model).toBe(RULES_ONLY_MODEL);
+    expect(response.suggestions[0]).toMatchObject({ suggestion: 'Colette uncovers the baked ratatouille.', unchanged: true });
+    expect(response.suggestions[0].reason).toMatch(/too short/);
+  });
+
+  it('still calls the model for a short description when the preset is not a Style option', async () => {
+    stubHappyWorld();
+
+    await new RefineService().getSuggestion({ ...baseInput, currentText: 'Colette uncovers the baked ratatouille.', presetId: 'polish' });
+
+    expect(mockedCallLlmChat).toHaveBeenCalledTimes(1);
   });
 
   it('gives every request its own requestId', async () => {

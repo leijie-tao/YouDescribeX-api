@@ -29,6 +29,10 @@ export interface RefinePreset {
   // Leijie Fix timing: the service runs the timing rules (refineTiming.util.ts) first and only calls
   // the model when they say "shorten". Its length limit is the word budget, so lengthRatio is unused.
   timing?: boolean;
+  // Leijie A description with fewer words than this is returned unchanged, without calling the model,
+  // because there is nothing to rearrange. Shown to the describer as `tooShortReason`.
+  minWords?: number;
+  tooShortReason?: string;
   instruction: string;
 }
 
@@ -41,6 +45,11 @@ export const STYLE_LENGTH_RATIO = 1.2;
 // else is, so the sum is already the natural upper bound.
 export const ADD_DETAILS_LENGTH_RATIO = 1;
 
+// Leijie Below this many words a style change has nothing to rearrange (e.g. "Colette uncovers the
+// baked ratatouille."), so the service answers without calling the model.
+export const STYLE_MIN_WORDS = 8;
+const STYLE_TOO_SHORT_REASON = 'The description is too short for a style change: there is nothing to rearrange.';
+
 // Leijie Every Style option shares one shell; only the name and the block of focus rules differ.
 const buildStyleInstruction = (styleName: string, styleRules: string[]): string =>
   [
@@ -49,6 +58,8 @@ const buildStyleInstruction = (styleName: string, styleRules: string[]): string 
     ...styleRules.map(rule => `- ${rule}`),
     'Rules:',
     '- Use only information from the current description and the context. If the description does not contain what this style needs, stay close to the original instead of inventing details.',
+    '- Never add a person, place, or object that the description does not mention. Wrong: "The sun sets." becomes "People watch the sun set." Wrong: "Colette uncovers the ratatouille." becomes "On the table, Colette uncovers the ratatouille."',
+    '- Keep every person, action, and object the description already mentions. Change the order and the emphasis, not the content.',
     '- Keep any on-screen text in quotation marks, exactly as written, even when it moves to a new position.',
     '- Never exceed the length limit.',
     '- Match the tone of the video. Consider its title and genre.',
@@ -66,7 +77,7 @@ const PRESETS = [
       'Keep, in this priority order:',
       '1. Who is acting and the main action.',
       '2. Information needed to follow the story or the instructions.',
-      '3. On-screen text.',
+      '3. On-screen text. Numbers, percentages, scores, prices, and times shown on screen count as on-screen text: keep every one of them.',
       '4. Names and key objects that later descriptions depend on.',
       'Remove first:',
       '- Details that do not change understanding: decorative adjectives, background clutter, camera language.',
@@ -87,11 +98,13 @@ const PRESETS = [
       '- Turn written-style sentences into clear spoken sentences: subject first, one main idea per sentence.',
       '- Change passive voice to active voice.',
       '- Replace a weak verb plus adverb with one precise verb. Example: "walks quickly" becomes "hurries".',
-      '- Replace a pronoun with a name or noun when it is unclear who it refers to.',
+      '- Use a pronoun ("he", "she", "it", "they") when it is clear who or what it refers to. Repeat the name only when the pronoun would be unclear.',
       '- Use "a" when something first appears and "the" after that.',
       '- Fix grammar, spelling, and punctuation errors.',
       'Do not:',
       '- Add, remove, or change any information.',
+      '- Split the description into many short one-fact sentences. Keep related actions together in one sentence.',
+      '- Drop articles ("a", "an", "the") that the sentence needs.',
       '- Replace technical or domain-specific terms with simpler words.',
       '- Make it noticeably longer than the original.',
     ].join('\n'),
@@ -124,16 +137,19 @@ const PRESETS = [
       'Keep, in this priority order:',
       '1. Who is acting and the main action.',
       '2. Information needed to follow the story or the instructions.',
-      '3. On-screen text, kept in quotation marks exactly as written.',
+      '3. On-screen text, kept in quotation marks exactly as written. Numbers, percentages, scores, prices, and times shown on screen count as on-screen text: keep every one of them.',
       'Cut first: adjectives and adverbs, setting details, secondary actions, and anything the previous description already says.',
       'A short phrase without a verb is acceptable if it stays clear, for example "Rapunzel at the window."',
       'The result must not exceed the length limit.',
+      'Use most of the length limit; keep any information that fits. Cut only as much as the AVAILABLE TIME requires.',
     ].join('\n'),
   },
   {
     id: 'style-character-focus',
     label: 'Character focus',
     lengthRatio: STYLE_LENGTH_RATIO,
+    minWords: STYLE_MIN_WORDS,
+    tooShortReason: STYLE_TOO_SHORT_REASON,
     instruction: buildStyleInstruction('character', [
       'Lead with the people: who they are, what they visibly look like when it matters to the story, and their facial expressions, body language, and reactions.',
       'Introduce a new character with a descriptor before the name, such as "a bearded man, Jack".',
@@ -144,6 +160,8 @@ const PRESETS = [
     id: 'style-action-focus',
     label: 'Action focus',
     lengthRatio: STYLE_LENGTH_RATIO,
+    minWords: STYLE_MIN_WORDS,
+    tooShortReason: STYLE_TOO_SHORT_REASON,
     instruction: buildStyleInstruction('action', [
       'Lead with what happens: the actions in the order they occur, using precise verbs.',
       'Mention people mainly as the ones doing the actions. Drop appearance and setting details unless they are needed to understand the action.',
@@ -154,6 +172,8 @@ const PRESETS = [
     id: 'style-environment-focus',
     label: 'Environment focus',
     lengthRatio: STYLE_LENGTH_RATIO,
+    minWords: STYLE_MIN_WORDS,
+    tooShortReason: STYLE_TOO_SHORT_REASON,
     instruction: buildStyleInstruction('environment', [
       'Lead with the setting: the location, the time of day, weather or lighting, key objects, and where things are placed in the space.',
       'Compare sizes and shapes to familiar objects when that helps.',
@@ -164,9 +184,12 @@ const PRESETS = [
     id: 'style-simple-language',
     label: 'Simple words',
     lengthRatio: STYLE_LENGTH_RATIO,
+    minWords: STYLE_MIN_WORDS,
+    tooShortReason: STYLE_TOO_SHORT_REASON,
     instruction: buildStyleInstruction('simple language', [
       'Use everyday words and short sentences that a child or a non-native English speaker can follow.',
       'Replace uncommon words with common ones.',
+      'Keep proper names exactly: names of people, characters, places, brands, and named dishes or objects. Never replace a name with a general word. Wrong: "ratatouille" becomes "the food".',
       'If a technical term is essential, keep it and add a few plain words that explain it.',
       'If an explanation would go over the length limit, keep the term and skip the explanation.',
       'No idioms or figures of speech.',

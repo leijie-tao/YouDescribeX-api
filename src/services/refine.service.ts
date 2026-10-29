@@ -99,6 +99,25 @@ class RefineService {
 
     if (preset?.timing) return this.fixTiming(requestId, input, preset, context);
 
+    // Leijie Too short to restyle: answer unchanged without calling the model. Checked after the
+    // ownership check, so it never answers for a clip the caller does not own.
+    if (preset?.minWords && this.countWords(input.currentText) < preset.minWords) {
+      logger.info(`[refine ${requestId}] clip: ${input.clipId}, ad: ${input.audioDescriptionId}, preset: ${preset.id}, skipped: too short`);
+      return {
+        requestId,
+        model: RULES_ONLY_MODEL,
+        suggestions: [
+          {
+            clipId: input.clipId,
+            original: input.currentText,
+            suggestion: input.currentText.trim(),
+            unchanged: true,
+            reason: preset.tooShortReason,
+          },
+        ],
+      };
+    }
+
     // Leijie Every text preset gets a length limit from the original's word count and never sees the
     // time budget; buildClipContext still computes it, for the log. Fix timing has its own gap rules
     // (refineTiming.util.ts). A free-text request has no preset and so no limit.
